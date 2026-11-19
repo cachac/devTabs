@@ -87,7 +87,7 @@ public struct TileLayout {
 }
 
 public enum MoveResult: Equatable, Sendable {
-    case none, swapped, joined, detached
+    case none, swapped, joined, detached, reordered
 }
 
 /// Un árbol listo para guardar en disco y recuperar al reabrir la app.
@@ -239,6 +239,14 @@ public final class LayoutTree {
     public func move(_ window: WindowID, _ direction: Direction, area: CGRect, config: Config) -> MoveResult {
         guard let tile = tile(containing: window) else { return .none }
         if tile.isStack && visible(tile).windows.count > 1 {
+            // ← y → corren la pestaña dentro del stack; sólo desde la primera o la última la sacan hacia ese lado.
+            if direction == .left || direction == .right, let index = visible(tile).windows.firstIndex(of: window) {
+                let target = index + (direction == .right ? 1 : -1)
+                if visible(tile).windows.indices.contains(target) {
+                    moveTab(window, to: target)
+                    return .reordered
+                }
+            }
             remove(window)
             split(tile, with: TileNode([window]), orientation: direction.orientation, newFirst: direction.placesFirst)
             return .detached
@@ -321,6 +329,26 @@ public final class LayoutTree {
         let next = list[(active + (forward ? 1 : list.count - 1)) % list.count]
         tile.active = tile.windows.firstIndex(of: next) ?? tile.active
         return next
+    }
+
+    /// Lleva una pestaña a otra posición entre las visibles de su stack. La activa sigue siendo la misma ventana y las ocultas
+    /// quedan en su posición. Devuelve `true` si cambió el orden.
+    @discardableResult
+    public func moveTab(_ window: WindowID, to index: Int) -> Bool {
+        guard let tile = tile(containing: window), tile.isStack else { return false }
+        var list = visible(tile).windows
+        guard let from = list.firstIndex(of: window) else { return false }
+        let to = min(max(0, index), list.count - 1)
+        guard from != to else { return false }
+        let activeWindow = tile.activeWindow
+        list.remove(at: from)
+        list.insert(window, at: to)
+        for (position, hiddenWindow) in tile.windows.enumerated() where hidden.contains(hiddenWindow) {
+            list.insert(hiddenWindow, at: min(position, list.count))
+        }
+        tile.windows = list
+        tile.active = activeWindow.flatMap { list.firstIndex(of: $0) } ?? 0
+        return true
     }
 
     /// Marca la ventana como la activa de su tile; devuelve `true` si cambió.

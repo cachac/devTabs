@@ -358,6 +358,43 @@ final class LayoutTreeTests: XCTestCase {
         XCTAssertNil(LayoutTree().step(1, forward: true))
     }
 
+    func testShiftArrowsMoveTheTabInsideTheStackAndDetachAtTheEdge() {
+        let tree = stack([1, 2, 3])
+        XCTAssertEqual(tree.move(3, .left, area: area, config: config), .reordered)
+        XCTAssertEqual(tree.tile(containing: 1)?.windows, [1, 3, 2])
+        XCTAssertEqual(tree.tile(containing: 1)?.activeWindow, 3)
+        XCTAssertEqual(tree.move(3, .left, area: area, config: config), .reordered)
+        XCTAssertEqual(tree.tile(containing: 1)?.windows, [3, 1, 2])
+        XCTAssertEqual(tree.move(3, .left, area: area, config: config), .detached)
+        XCTAssertEqual(tree.tiles.count, 2)
+        XCTAssertEqual(frames(tree)[3]?.minX, 0)
+        XCTAssertEqual(tree.tile(containing: 1)?.windows, [1, 2])
+    }
+
+    func testUpAndDownStillTakeTheTabOutOfTheStack() {
+        let tree = stack([1, 2])
+        XCTAssertEqual(tree.move(1, .down, area: area, config: config), .detached)
+        XCTAssertEqual(tree.tiles.count, 2)
+    }
+
+    func testDroppingATabPutsItAtThatPosition() {
+        let tree = stack([1, 2, 3, 4])
+        XCTAssertTrue(tree.moveTab(1, to: 2))
+        XCTAssertEqual(tree.tile(containing: 1)?.windows, [2, 3, 1, 4])
+        XCTAssertEqual(tree.tile(containing: 1)?.activeWindow, 4)
+        XCTAssertTrue(tree.moveTab(4, to: 0))
+        XCTAssertEqual(tree.tile(containing: 1)?.windows, [4, 2, 3, 1])
+        XCTAssertFalse(tree.moveTab(4, to: 0))
+    }
+
+    func testReorderingKeepsHiddenTabsInPlace() {
+        let tree = stack([1, 2, 3])
+        tree.setHidden(2, true)
+        tree.moveTab(3, to: 0)
+        XCTAssertEqual(tree.tile(containing: 1)?.windows, [3, 2, 1])
+        XCTAssertEqual(tree.layout(in: area, config: config).first?.frames.map(\.window), [3, 1])
+    }
+
     func testCycleWrapsAround() {
         let tree = stack([1, 2])
         XCTAssertEqual(tree.cycle(2, forward: true), 1)

@@ -68,6 +68,7 @@ enum Keys {
         bind("a") { wm.toggleAccordion() }
         bind("o") { wm.toggleOrientation() }
         bind("g") { wm.toggleFloat() }
+        bind("z") { wm.toggleZoom() }
         bind("y") { wm.toggleTiling() }
         bind("+") { wm.resize(by: 0.05) }
         bind("-") { wm.resize(by: -0.05) }

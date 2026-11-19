@@ -6,6 +6,8 @@ struct TabItem: Equatable {
     let title: String
     let pid: pid_t
     let active: Bool
+    /// Cambió de título desde la última vez que se la miró.
+    let activity: Bool
 }
 
 /// La barra de un stack: una ventana flotante sin borde que no se lleva el foco al hacer clic.
@@ -35,9 +37,15 @@ final class TabBarView: NSView {
         didSet { if tabs != oldValue { needsDisplay = true } }
     }
     var onClick: ((WindowID) -> Void)?
+    /// Una pestaña arrastrada y soltada sobre otra posición: la ventana y la posición nueva.
+    var onReorder: ((WindowID, Int) -> Void)?
 
     private let accent = NSColor(srgbRed: 0.98, green: 0.70, blue: 0.36, alpha: 1)
     private var icons: [pid_t: NSImage] = [:]
+    private var dragStart: Int?
+    private var dropTarget: Int? {
+        didSet { if dropTarget != oldValue { needsDisplay = true } }
+    }
 
     override var isFlipped: Bool { true }
 
@@ -70,16 +78,52 @@ final class TabBarView: NSView {
                 .foregroundColor: tab.active ? NSColor.black : NSColor.labelColor,
                 .paragraphStyle: paragraph,
             ]
-            let text = NSRect(x: x, y: cell.midY - 8, width: max(0, cell.maxX - x - 6), height: 16)
+            var textEnd = cell.maxX - 6
+            if tab.activity && !tab.active {
+                accent.setFill()
+                NSBezierPath(ovalIn: NSRect(x: cell.maxX - 14, y: cell.midY - 4, width: 8, height: 8)).fill()
+                textEnd -= 12
+            }
+            let text = NSRect(x: x, y: cell.midY - 8, width: max(0, textEnd - x), height: 16)
             (tab.title as NSString).draw(with: text, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attributes)
+            if index == dropTarget {
+                accent.setStroke()
+                let outline = NSBezierPath(roundedRect: cell.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
+                outline.lineWidth = 2
+                outline.stroke()
+            }
         }
     }
 
+    /// Un clic elige la pestaña; arrastrarla y soltarla sobre otra la lleva a esa posición.
     override func mouseDown(with event: NSEvent) {
-        guard !tabs.isEmpty else { return }
+        dragStart = index(at: event)
+        dropTarget = nil
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragStart, let current = index(at: event) else { return }
+        dropTarget = current == start ? nil : current
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            dragStart = nil
+            dropTarget = nil
+        }
+        guard let start = dragStart, tabs.indices.contains(start) else { return }
+        if let target = dropTarget {
+            onReorder?(tabs[start].id, target)
+        } else if index(at: event) == start {
+            onClick?(tabs[start].id)
+        }
+    }
+
+    private func index(at event: NSEvent) -> Int? {
+        guard !tabs.isEmpty else { return nil }
         let point = convert(event.locationInWindow, from: nil)
         let index = Int(point.x / (bounds.width / CGFloat(tabs.count)))
-        if tabs.indices.contains(index) { onClick?(tabs[index].id) }
+        return tabs.indices.contains(index) ? index : nil
     }
 
     private func icon(for pid: pid_t) -> NSImage? {

@@ -43,6 +43,12 @@ final class WindowManager {
     private var dragging: WindowID?
     /// Lo último que se guardó en disco, para no escribir si nada cambió.
     private var lastSaved: Data?
+    /// Ventanas que el usuario volvió a acomodar con G: no pasan a flotar solas aunque no llenen su lugar.
+    private var tiledByUser: Set<WindowID> = []
+    /// Pestañas de atrás que cambiaron de título desde la última vez que se miraron.
+    private var activity: Set<WindowID> = []
+    /// La ventana en zoom temporal y su workspace.
+    private var zoomed: (window: WindowID, key: String)?
 
     /// Una ventana que no está en pantalla pero sigue viva: minimizada, o de una app oculta con ⌘H.
     private static func isDormant(_ window: AXWindow) -> Bool {
@@ -138,6 +144,7 @@ final class WindowManager {
             handleFocus()
             scheduleRefresh()
         case kAXTitleChangedNotification:
+            noteActivity(element)
             scheduleBars()
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
             userMoved(element)
@@ -164,7 +171,7 @@ final class WindowManager {
             return
         }
         dragging = nil
-        if let key = windowSpace[window], let tree = trees[key], let display = displays.first(where: { $0.key == key }),
+        if zoomed?.window != window, let key = windowSpace[window], let tree = trees[key], let display = displays.first(where: { $0.key == key }),
            let ax = known[window], let frame = AX.frame(ax.element) {
             if let peek = tree.adjustPeek(window, toFit: frame, area: display.area, config: config) {
                 config.accordionPadding = peek
@@ -194,9 +201,42 @@ final class WindowManager {
     }
 
     /// Si el foco cae en una pestaña de atrás (⌘Tab, clic), esa pasa a ser la activa de su stack.
+    /// Una pestaña de atrás cambió de título (una tarea terminó, una página cargó): queda marcada hasta que se la mira.
+    private func noteActivity(_ element: AXUIElement) {
+        guard let window = AX.windowID(element), let key = windowSpace[window],
+              let tile = trees[key]?.tile(containing: window), tile.isStack, tile.activeWindow != window else { return }
+        activity.insert(window)
+    }
+
+    private func isTiledAndVisible(_ window: WindowID, in key: String) -> Bool {
+        guard let tree = trees[key] else { return false }
+        return tree.contains(window) && !tree.hidden.contains(window) && !floating.contains(window)
+    }
+
+    /// Zoom temporal: la ventana enfocada ocupa todo su monitor por encima de las demás, que no se mueven. La misma tecla la
+    /// devuelve; también termina al enfocar otra ventana de ese workspace o al usar otro comando.
+    func toggleZoom() {
+        guard let context = focusedContext(), isTiledAndVisible(context.window, in: context.display.key) else { return }
+        if zoomed?.window == context.window {
+            zoomed = nil
+        } else {
+            zoomed = (context.window, context.display.key)
+        }
+        apply()
+        focusWindow(context.window)
+    }
+
+    private func endZoom() {
+        guard zoomed != nil else { return }
+        zoomed = nil
+        apply()
+    }
+
     private func handleFocus() {
         guard let window = focusedWindowID(), let key = windowSpace[window], let tree = trees[key] else { return }
         lastFocused = window
+        activity.remove(window)
+        if let zoom = zoomed, zoom.key == key, zoom.window != window { endZoom() }
         if tree.activate(window) {
             apply()
             restack(window)
@@ -231,9 +271,11 @@ final class WindowManager {
         }
         known = seen
         observedWindows.formIntersection(seen.keys)
+        activity.formIntersection(alive.keys)
         placedAt = placedAt.filter { seen[$0.key] != nil }
 
         let focused = focusedWindowID()
+        var inserted: [WindowID] = []
         for display in displays where !display.isFullscreen {
             let tree = trees[display.key] ?? newTree(display.key)
             let here = visible[display.key] ?? []
@@ -261,35 +303,70 @@ final class WindowManager {
                 let anchor = [focused, lastFocused].compactMap { $0 }.first { tree.contains($0) }
                 tree.insert(window, focused: anchor, area: display.area, config: config)
                 windowSpace[window] = display.key
+                inserted.append(window)
             }
         }
         apply()
+        if !inserted.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.floatFixedSize(inserted) }
+        }
+    }
+
+    /// Una ventana recién acomodada que no crece hasta su lugar (Ajustes del Sistema, Calculadora) es de tamaño fijo: sale del
+    /// layout y flota centrada. Las que no llegan a achicarse (tamaño mínimo) siguen acomodadas. Si el usuario la vuelve a
+    /// acomodar con G, se respeta.
+    private func floatFixedSize(_ windows: [WindowID]) {
+        var changed = false
+        for window in windows where !tiledByUser.contains(window) {
+            guard let key = windowSpace[window], let tree = trees[key], tree.enabled, !tree.hidden.contains(window),
+                  let display = displays.first(where: { $0.key == key }), let ax = known[window],
+                  let expected = tree.expectedFrame(of: window, area: display.area, config: config),
+                  let actual = AX.frame(ax.element),
+                  actual.width < expected.width - 40 || actual.height < expected.height - 40 else { continue }
+            tree.remove(window)
+            windowSpace[window] = nil
+            floating.insert(window)
+            placedAt[window] = Date()
+            AX.setPosition(ax.element, CGPoint(x: (display.area.midX - actual.width / 2).rounded(),
+                                               y: (display.area.midY - actual.height / 2).rounded()))
+            Log.write("ventana \(window) de tamaño fijo: queda flotando")
+            changed = true
+        }
+        if changed { apply() }
     }
 
     // MARK: - Aplicar el layout
 
     func apply(frames: Bool = true) {
         let moveWindows = frames && dragging == nil
+        if let zoom = zoomed, !isTiledAndVisible(zoom.window, in: zoom.key) { zoomed = nil }
         var live = Set<ObjectIdentifier>()
         for display in displays where !display.isFullscreen {
             guard let tree = trees[display.key], tree.enabled else { continue }
+            let zoomedHere = zoomed?.key == display.key ? zoomed?.window : nil
             for layout in tree.layout(in: display.area, config: config) {
                 if moveWindows {
-                    for item in layout.frames {
+                    for item in layout.frames where item.window != zoomedHere {
                         if let ax = known[item.window] { setFrameIfNeeded(ax, item.frame) }
                     }
                 }
-                guard let barRect = layout.barRect else { continue }
+                // Con una ventana en zoom, las barras de ese workspace se esconden para no quedar encima de ella.
+                guard zoomedHere == nil, let barRect = layout.barRect else { continue }
                 let id = ObjectIdentifier(layout.tile)
                 live.insert(id)
                 let panel = bars[id] ?? makeBar(id)
                 panel.bar.tabs = layout.frames.map { item in
-                    TabItem(id: item.window, title: title(of: item.window), pid: known[item.window]?.pid ?? 0,
-                            active: item.window == layout.activeWindow)
+                    let active = item.window == layout.activeWindow
+                    if active { activity.remove(item.window) }
+                    return TabItem(id: item.window, title: title(of: item.window), pid: known[item.window]?.pid ?? 0,
+                                   active: active, activity: activity.contains(item.window))
                 }
                 let frame = Spaces.flip(barRect)
                 if panel.frame != frame { panel.setFrame(frame, display: true) }
                 if !panel.isVisible { panel.orderFrontRegardless() }
+            }
+            if moveWindows, let window = zoomedHere, let ax = known[window] {
+                setFrameIfNeeded(ax, display.area.insetBy(dx: config.gap, dy: config.gap))
             }
         }
         for (id, panel) in bars where !live.contains(id) {
@@ -310,6 +387,7 @@ final class WindowManager {
     private func makeBar(_ id: ObjectIdentifier) -> TabBarPanel {
         let panel = TabBarPanel()
         panel.bar.onClick = { [weak self] window in self?.selectTab(window) }
+        panel.bar.onReorder = { [weak self] window, index in self?.reorderTab(window, to: index) }
         bars[id] = panel
         return panel
     }
@@ -359,6 +437,7 @@ final class WindowManager {
 
     func move(_ direction: Direction) {
         guard let context = focusedContext(), !floating.contains(context.window) else { return }
+        zoomed = nil
         let result = context.tree.move(context.window, direction, area: context.display.area, config: config)
         if result == .none, let display = display(beside: context.display, direction) {
             context.tree.remove(context.window)
@@ -367,12 +446,14 @@ final class WindowManager {
             windowSpace[context.window] = display.key
         }
         apply()
+        if result == .reordered { restack(context.window) }
         focusWindow(context.window)
     }
 
     /// Junta en un stack todas las ventanas del monitor y Space de la ventana enfocada; si ya están juntas, las separa.
     func toggleStack() {
         guard let context = focusedContext() else { return }
+        zoomed = nil
         context.tree.toggleStackAll(context.window, area: context.display.area, config: config)
         apply()
         focusWindow(context.window)
@@ -380,10 +461,20 @@ final class WindowManager {
 
     func selectTab(_ window: WindowID) {
         guard let key = windowSpace[window], let tree = trees[key] else { return }
+        zoomed = nil
         tree.activate(window)
         apply()
         restack(window)
         focusWindow(window)
+    }
+
+    /// Una pestaña soltada en otra posición de la barra. La activa no cambia.
+    func reorderTab(_ window: WindowID, to index: Int) {
+        guard let key = windowSpace[window], let tree = trees[key], tree.moveTab(window, to: index),
+              let active = tree.tile(containing: window)?.activeWindow else { return }
+        apply()
+        restack(active)
+        focusWindow(active)
     }
 
     /// En un acordeón de tres o más pestañas, las de atrás se apilan de la más lejana a la más cercana a la activa, para que
@@ -401,18 +492,21 @@ final class WindowManager {
 
     func toggleAccordion() {
         guard let context = focusedContext() else { return }
+        zoomed = nil
         context.tree.toggleAccordion(context.window)
         apply()
     }
 
     func toggleOrientation() {
         guard let context = focusedContext() else { return }
+        zoomed = nil
         context.tree.toggleOrientation(context.window)
         apply()
     }
 
     func resize(by delta: CGFloat) {
         guard let context = focusedContext() else { return }
+        zoomed = nil
         context.tree.adjustRatio(context.window, by: delta)
         apply()
     }
@@ -421,7 +515,9 @@ final class WindowManager {
     /// Volver: ocupa otra vez exactamente ese lugar.
     func toggleFloat() {
         guard let window = focusedWindowID(), let ax = known[window] else { return }
+        zoomed = nil
         if floating.remove(window) != nil {
+            tiledByUser.insert(window)
             refresh()
             focusWindow(window)
             return
@@ -431,15 +527,20 @@ final class WindowManager {
         floating.insert(window)
         apply()
         let a = display.area
+        let target = CGRect(x: a.midX - a.width * 0.3, y: a.midY - a.height * 0.35, width: a.width * 0.6, height: a.height * 0.7).integral
         placedAt[window] = Date()
-        AX.setFrame(ax.element, CGRect(x: a.midX - a.width * 0.3, y: a.midY - a.height * 0.35,
-                                       width: a.width * 0.6, height: a.height * 0.7).integral)
+        AX.setFrame(ax.element, target)
+        // Una app que no acepta ese tamaño (Ajustes del Sistema tiene ancho fijo) se centra con el tamaño que sí tomó.
+        if let actual = AX.frame(ax.element), abs(actual.width - target.width) > 2 || abs(actual.height - target.height) > 2 {
+            AX.setPosition(ax.element, CGPoint(x: (a.midX - actual.width / 2).rounded(), y: (a.midY - actual.height / 2).rounded()))
+        }
         focusWindow(window)
     }
 
     /// Prende o apaga el tiling del Space visible en el monitor de la ventana enfocada.
     func toggleTiling() {
         guard let display = focusedDisplay() else { return }
+        zoomed = nil
         let tree = trees[display.key] ?? newTree(display.key)
         tree.enabled.toggle()
         Log.write("tiling \(tree.enabled ? "prendido" : "apagado") en \(display.key)")
@@ -459,6 +560,7 @@ final class WindowManager {
     private func focusWindow(_ window: WindowID) {
         guard let ax = known[window] else { return }
         lastFocused = window
+        activity.remove(window)
         AX.perform(ax.element, kAXRaiseAction)
         AX.set(ax.element, kAXMainAttribute, kCFBooleanTrue)
         AX.set(AXUIElementCreateApplication(ax.pid), kAXFrontmostAttribute, kCFBooleanTrue)

@@ -79,6 +79,11 @@ enum AX {
         if let value = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value) }
     }
 
+    static func setPosition(_ element: AXUIElement, _ point: CGPoint) {
+        var origin = point
+        if let value = AXValueCreate(.cgPoint, &origin) { AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value) }
+    }
+
     static func set(_ element: AXUIElement, _ name: String, _ value: CFTypeRef) {
         _ = AXUIElementSetAttributeValue(element, name as CFString, value)
     }
