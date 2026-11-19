@@ -52,12 +52,23 @@ final class LayoutTreeTests: XCTestCase {
         XCTAssertEqual(f[2], CGRect(x: 804, y: 8, width: 788, height: 984))
     }
 
-    func testTheBarIsSeparatedFromItsWindowsByTheGap() {
+    func testTheBarSticksToTheTopEdgeAndToItsWindows() {
         let tree = stack([1, 2])
         let gapped = Config(gap: 8, barHeight: 28, accordionPadding: 30)
-        let layout = tree.layout(in: area, config: gapped).first
-        XCTAssertEqual(layout?.barRect, CGRect(x: 8, y: 8, width: 1584, height: 28))
-        XCTAssertEqual(frames(tree, gapped)[2], CGRect(x: 8, y: 44, width: 1584, height: 948))
+        XCTAssertEqual(tree.layout(in: area, config: gapped).first?.barRect, CGRect(x: 8, y: 0, width: 1584, height: 28))
+        XCTAssertEqual(frames(tree, gapped)[2], CGRect(x: 8, y: 28, width: 1584, height: 964))
+    }
+
+    func testABarBelowAnotherWindowKeepsTheGapAboveIt() {
+        let tree = LayoutTree()
+        insert(tree, 1)
+        insert(tree, 2, focused: 1)
+        tree.toggleOrientation(1)
+        tree.toggleStack(2, area: area, config: config)
+        let gapped = Config(gap: 8, barHeight: 28, accordionPadding: 30)
+        let layout = tree.layout(in: area, config: gapped).first { $0.tile.isStack }
+        XCTAssertEqual(layout?.barRect, CGRect(x: 8, y: 504, width: 1584, height: 28))
+        XCTAssertEqual(frames(tree, gapped)[2], CGRect(x: 8, y: 532, width: 1584, height: 460))
     }
 
     func testRemovingCollapsesTheSplit() {
@@ -442,5 +453,17 @@ final class LayoutTreeTests: XCTestCase {
         tree.toggleOrientation(1)
         XCTAssertEqual(frames(tree)[1], CGRect(x: 0, y: 0, width: 1600, height: 500))
         XCTAssertEqual(frames(tree)[2], CGRect(x: 0, y: 500, width: 1600, height: 500))
+    }
+
+    func testRenumberedSpaceTakesTheTreeWhoseSpaceIsGone() {
+        let trees = ["A#538": stack([1, 2]), "A#8": stack([3]), "B#1": stack([4, 5])]
+        XCTAssertEqual(movedTree(showing: [1, 2], trees: trees, liveSpaces: [1405, 8, 1]), "A#538")
+    }
+
+    func testLiveSpacesKeepTheirTrees() {
+        let trees = ["A#538": stack([1, 2]), "B#1": stack([4, 5])]
+        XCTAssertNil(movedTree(showing: [4, 5], trees: trees, liveSpaces: [1405, 1]))
+        XCTAssertNil(movedTree(showing: [9], trees: trees, liveSpaces: [1405, 1]))
+        XCTAssertNil(movedTree(showing: [1, 2], trees: trees, liveSpaces: []))
     }
 }

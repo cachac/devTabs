@@ -18,7 +18,26 @@ private typealias CopyManagedDisplaySpacesFn = @convention(c) (Int32) -> Unmanag
 private let mainConnection: MainConnectionFn? = dlsym(rtldDefault, "CGSMainConnectionID").map { unsafeBitCast($0, to: MainConnectionFn.self) }
 private let copyManagedDisplaySpaces: CopyManagedDisplaySpacesFn? = dlsym(rtldDefault, "CGSCopyManagedDisplaySpaces").map { unsafeBitCast($0, to: CopyManagedDisplaySpacesFn.self) }
 
+private typealias CopySpacesForWindowsFn = @convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFArray>?
+private let copySpacesForWindows: CopySpacesForWindowsFn? = dlsym(rtldDefault, "CGSCopySpacesForWindows").map { unsafeBitCast($0, to: CopySpacesForWindowsFn.self) }
+
 enum Spaces {
+    /// El Space donde está una ventana según el servidor de ventanas, o `nil` si no se pudo saber.
+    static func space(of window: UInt32) -> Int? {
+        guard let mainConnection, let copySpacesForWindows else { return nil }
+        let ids = [NSNumber(value: window)] as CFArray
+        guard let list = copySpacesForWindows(mainConnection(), 0x7, ids)?.takeRetainedValue() as? [NSNumber] else { return nil }
+        return list.first?.intValue
+    }
+
+    /// Todos los Spaces que existen, en todos los monitores, o un conjunto vacío si no se pudo saber.
+    static func liveSpaceIDs() -> Set<Int> {
+        guard let mainConnection, let copyManagedDisplaySpaces,
+              let list = copyManagedDisplaySpaces(mainConnection())?.takeRetainedValue() as? [[String: Any]] else { return [] }
+        let spaces = list.flatMap { ($0["Spaces"] as? [[String: Any]]) ?? [] }
+        return Set(spaces.compactMap { ($0["ManagedSpaceID"] as? Int) ?? ($0["id64"] as? Int) })
+    }
+
     static func current() -> [DisplaySpace] {
         var byDisplay: [String: (id: Int, fullscreen: Bool)] = [:]
         if let mainConnection, let copyManagedDisplaySpaces,

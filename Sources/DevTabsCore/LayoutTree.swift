@@ -145,7 +145,8 @@ public final class LayoutTree {
 
     public func layout(in area: CGRect, config: Config) -> [TileLayout] {
         var out: [TileLayout] = []
-        place(root, in: area.insetBy(dx: config.gap, dy: config.gap), config: config, into: &out)
+        let inner = area.insetBy(dx: config.gap, dy: config.gap)
+        place(root, in: inner, top: inner.minY, config: config, into: &out)
         return out
     }
 
@@ -474,18 +475,18 @@ public final class LayoutTree {
     }
 
     /// Una división con un lado oculto le da todo el espacio al otro.
-    private func place(_ node: Node?, in rect: CGRect, config: Config, into out: inout [TileLayout]) {
+    private func place(_ node: Node?, in rect: CGRect, top: CGFloat, config: Config, into out: inout [TileLayout]) {
         guard let node, isVisible(node) else { return }
         if let split = node as? SplitNode {
             guard isVisible(split.first), isVisible(split.second) else {
-                place(isVisible(split.first) ? split.first : split.second, in: rect, config: config, into: &out)
+                place(isVisible(split.first) ? split.first : split.second, in: rect, top: top, config: config, into: &out)
                 return
             }
             let (a, b) = Self.divide(rect, split.orientation, split.ratio, config.gap)
-            place(split.first, in: a, config: config, into: &out)
-            place(split.second, in: b, config: config, into: &out)
+            place(split.first, in: a, top: top, config: config, into: &out)
+            place(split.second, in: b, top: top, config: config, into: &out)
         } else if let tile = node as? TileNode {
-            out.append(tileLayout(tile, rect, config))
+            out.append(tileLayout(tile, rect, config, atTop: abs(rect.minY - top) < 0.5))
         }
     }
 
@@ -535,16 +536,15 @@ public final class LayoutTree {
     /// En pestañas todas las ventanas ocupan el mismo lugar debajo de la barra. En acordeón cada una tiene un lugar fijo,
     /// corrido una franja respecto de la anterior y con el mismo ancho: cambiar de pestaña sólo cambia cuál queda adelante, así
     /// ninguna ventana cambia de tamaño ni reacomoda su contenido.
-    private func tileLayout(_ tile: TileNode, _ r: CGRect, _ config: Config) -> TileLayout {
+    private func tileLayout(_ tile: TileNode, _ r: CGRect, _ config: Config, atTop: Bool) -> TileLayout {
         let (list, active) = visible(tile)
         let activeWindow = list.indices.contains(active) ? list[active] : nil
         guard tile.isStack else {
             return TileLayout(tile: tile, rect: r, barRect: nil, frames: list.map { ($0, r) }, activeWindow: activeWindow)
         }
-        let bar = CGRect(x: r.minX, y: r.minY, width: r.width, height: config.barHeight)
-        // Entre la barra y las ventanas va la misma separación que entre ventanas.
-        let top = config.barHeight + config.gap
-        let content = CGRect(x: r.minX, y: r.minY + top, width: r.width, height: max(0, r.height - top))
+        // La barra de un stack que llega arriba de todo se pega al borde de la pantalla, y las ventanas se pegan a la barra.
+        let bar = CGRect(x: r.minX, y: r.minY - (atTop ? config.gap : 0), width: r.width, height: config.barHeight)
+        let content = CGRect(x: r.minX, y: bar.maxY, width: r.width, height: max(0, r.maxY - bar.maxY))
         var frames: [(window: WindowID, frame: CGRect)] = list.map { ($0, content) }
         if tile.mode == .accordion && list.count > 1 {
             let peek = Self.peek(tile, list.count, content.width, config)

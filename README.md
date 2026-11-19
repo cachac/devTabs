@@ -30,6 +30,8 @@ Un punto naranja en una pestaña de atrás avisa que su ventana cambió de títu
 
 Vuelven los stacks, los acordeones, los tamaños y las ventanas flotantes de todo lo que siga abierto.
 
+Al despertar la Mac o reconectar un monitor, cada workspace conserva sus stacks y acordeones.
+
 ## Menú
 
 En el ícono de la barra de menú: prender o apagar el tiling, reacomodar, separación entre ventanas, la lista de atajos y salir.

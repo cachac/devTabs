@@ -49,6 +49,11 @@ final class WindowManager {
     private var activity: Set<WindowID> = []
     /// La ventana en zoom temporal y su workspace.
     private var zoomed: (window: WindowID, key: String)?
+    /// Mientras la Mac o los monitores duermen, y hasta 3 s después del último cambio de monitores, macOS mueve ventanas entre
+    /// monitores y renumera los Spaces: devTabs no lee ni acomoda nada hasta que todo se asiente.
+    private var asleep = false
+    private var settling = false
+    private var settleWork: DispatchWorkItem?
 
     /// Una ventana que no está en pantalla pero sigue viva: minimizada, o de una app oculta con ⌘H.
     private static func isDormant(_ window: AXWindow) -> Bool {
@@ -120,8 +125,14 @@ final class WindowManager {
             self?.handleFocus()
             self?.scheduleRefresh()
         }
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.settle(asleep: true) }
+        }
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.settle(asleep: false) }
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.scheduleRefresh()
+            self?.settle(asleep: nil)
         }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
         restore()
@@ -180,6 +191,20 @@ final class WindowManager {
             tree.resizeTile(window, to: frame, area: display.area, config: config)
         }
         refresh()
+    }
+
+    /// Frena la lectura de ventanas; al despertar o tras un cambio de monitores, la retoma cuando pasan 3 s sin otro cambio.
+    private func settle(asleep: Bool?) {
+        if let asleep { self.asleep = asleep }
+        settling = true
+        settleWork?.cancel()
+        guard !self.asleep else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.settling = false
+            self?.refresh()
+        }
+        settleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
     }
 
     func scheduleRefresh() {
@@ -247,6 +272,7 @@ final class WindowManager {
     // MARK: - Lectura de ventanas
 
     func refresh() {
+        guard !settling else { return }
         displays = Spaces.current()
         let onScreen = Self.onScreenWindowIDs()
         var seen: [WindowID: AXWindow] = [:]
@@ -266,6 +292,9 @@ final class WindowManager {
                       let frame = AX.frame(element), let display = display(containing: frame), !display.isFullscreen else { continue }
                 seen[id] = window
                 observe(window)
+                // Mientras macOS cambia de Space, las ventanas del Space anterior siguen en pantalla un instante: sólo cuenta
+                // la que el servidor de ventanas ya ubica en el Space visible de ese monitor.
+                if let space = Spaces.space(of: id), space != display.spaceID { continue }
                 visible[display.key, default: []].append(id)
             }
         }
@@ -274,7 +303,19 @@ final class WindowManager {
         activity.formIntersection(alive.keys)
         placedAt = placedAt.filter { seen[$0.key] != nil }
 
+        // Un Space renumerado (al despertar, al reconectar un monitor) se queda con el árbol del Space que ya no existe, con sus
+        // stacks y acordeones.
+        let liveSpaces = Spaces.liveSpaceIDs()
+        for display in displays where !display.isFullscreen && trees[display.key]?.windows.isEmpty ?? true {
+            guard let old = movedTree(showing: Set(visible[display.key] ?? []), trees: trees, liveSpaces: liveSpaces),
+                  let tree = trees.removeValue(forKey: old) else { continue }
+            trees[display.key] = tree
+            for window in tree.windows { windowSpace[window] = display.key }
+            Log.write("el workspace \(old) ahora es \(display.key)")
+        }
+
         let focused = focusedWindowID()
+        let existing = Self.existingWindowIDs()
         var inserted: [WindowID] = []
         for display in displays where !display.isFullscreen {
             let tree = trees[display.key] ?? newTree(display.key)
@@ -283,6 +324,8 @@ final class WindowManager {
             for window in tree.windows where !hereSet.contains(window) {
                 if let ax = alive[window], Self.isDormant(ax) {
                     tree.setHidden(window, true)   // minimizada o de una app oculta: conserva su lugar
+                } else if existing.contains(window), Spaces.space(of: window) ?? display.spaceID == display.spaceID {
+                    continue   // sigue en este Space y todavía no está en pantalla (un cambio de Space a medias): se queda
                 } else {
                     tree.remove(window)
                     floating.remove(window)
@@ -549,12 +592,31 @@ final class WindowManager {
 
     // MARK: - Foco
 
+    /// Apps que no informaron su ventana enfocada, para anotarlo en el log una sola vez.
+    private var guessedApps: Set<pid_t> = []
+
+    /// La ventana enfocada de la app de adelante. Si la app no la informa por Accesibilidad, vale su ventana de más adelante; si
+    /// el foco está en un proceso sin ventanas, la de más adelante del monitor bajo el mouse. Nunca una ventana de otra app que
+    /// el usuario dejó de mirar.
     func focusedWindowID() -> WindowID? {
-        let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.3)
-        guard let app = AX.element(system, kAXFocusedApplicationAttribute),
-              let window = AX.element(app, kAXFocusedWindowAttribute) else { return nil }
-        return AX.windowID(window)
+        let app = NSWorkspace.shared.frontmostApplication
+        if let app {
+            let element = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(element, 0.3)
+            if let window = AX.element(element, kAXFocusedWindowAttribute) ?? AX.element(element, kAXMainWindowAttribute),
+               let id = AX.windowID(window) {
+                return id
+            }
+        }
+        let windows = Self.onScreenWindows()
+        var guess = app.flatMap { app in windows.first { $0.pid == app.processIdentifier }?.id }
+        if guess == nil, let mouse = mouseDisplay() {
+            guess = windows.first { known[$0.id] != nil && display(containing: $0.bounds)?.key == mouse.key }?.id
+        }
+        if let app, let guess, guessedApps.insert(app.processIdentifier).inserted {
+            Log.write("\(app.localizedName ?? "una app") no informa su ventana enfocada: uso la de adelante (\(guess))")
+        }
+        return guess
     }
 
     private func focusWindow(_ window: WindowID) {
@@ -568,7 +630,7 @@ final class WindowManager {
     }
 
     private func focusedContext() -> (window: WindowID, tree: LayoutTree, display: DisplaySpace)? {
-        guard let window = focusedWindowID() ?? lastFocused, let key = windowSpace[window], let tree = trees[key],
+        guard let window = focusedWindowID(), let key = windowSpace[window], let tree = trees[key],
               let display = displays.first(where: { $0.key == key }) else { return nil }
         return (window, tree, display)
     }
@@ -577,8 +639,12 @@ final class WindowManager {
         if let window = focusedWindowID(), let key = windowSpace[window], let display = displays.first(where: { $0.key == key }) {
             return display
         }
+        return mouseDisplay() ?? displays.first
+    }
+
+    private func mouseDisplay() -> DisplaySpace? {
         let mouse = Spaces.flip(CGRect(origin: NSEvent.mouseLocation, size: .zero)).origin
-        return displays.first { $0.frame.contains(mouse) } ?? displays.first
+        return displays.first { $0.frame.contains(mouse) }
     }
 
     // MARK: - Ayudas
@@ -635,13 +701,20 @@ final class WindowManager {
         observedWindows.insert(window.id)
     }
 
-    private static func onScreenWindowIDs() -> Set<WindowID> {
+    /// Las ventanas normales en pantalla, de la de más adelante a la de más atrás. `bounds` usa las coordenadas de Accesibilidad.
+    private static func onScreenWindows() -> [(id: WindowID, pid: pid_t, bounds: CGRect)] {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return []
         }
-        return Set(list.compactMap { info in
-            guard (info[kCGWindowLayer as String] as? Int) == 0 else { return nil }
-            return (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
-        })
+        return list.compactMap { info in
+            guard (info[kCGWindowLayer as String] as? Int) == 0,
+                  let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let dict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dict) else { return nil }
+            return (id, pid, bounds)
+        }
     }
+
+    private static func onScreenWindowIDs() -> Set<WindowID> { Set(onScreenWindows().map(\.id)) }
 }
