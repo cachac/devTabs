@@ -59,11 +59,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             option.state = CGFloat(value) == wm.config.gap ? .on : .off
         }
         menu.addItem(withTitle: "Separación entre ventanas", action: nil, keyEquivalent: "").submenu = gaps
+        menu.addItem(withTitle: "Atajos", action: nil, keyEquivalent: "").submenu = shortcutsMenu()
         menu.addItem(.separator())
         menu.addItem(withTitle: "Salir de devTabs", action: #selector(quit), keyEquivalent: "q").target = self
         item.menu = menu
         statusItem = item
     }
+
+    /// Lista de sólo lectura: elegir una fila no hace nada, sólo cierra el menú.
+    private func shortcutsMenu() -> NSMenu {
+        let list = NSMenu()
+        list.autoenablesItems = false
+        func header(_ text: String) {
+            let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+            item.attributedTitle = NSAttributedString(string: text, attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
+            item.isEnabled = false
+            list.addItem(item)
+        }
+        func row(_ keys: String, _ action: String) {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.tabStops = [NSTextTab(textAlignment: .left, location: 170)]
+            let text = "\(keys)\t\(action)"
+            let item = NSMenuItem(title: text, action: #selector(readOnly), keyEquivalent: "")
+            item.target = self
+            item.attributedTitle = NSAttributedString(string: text, attributes: [.paragraphStyle: paragraph, .font: NSFont.menuFont(ofSize: 0)])
+            list.addItem(item)
+        }
+        header("Control + Comando +")
+        for entry in Keys.reference { row(entry.keys, entry.action) }
+        list.addItem(.separator())
+        header("Con el mouse")
+        row("Clic en una pestaña", "Activarla")
+        row("Arrastrar una pestaña", "Llevarla a otra posición")
+        row("Arrastrar un borde", "Cambiar tamaños o la franja del acordeón")
+        row("Soltar en otro monitor", "Acomodar la ventana ahí")
+        return list
+    }
+
+    @objc private func readOnly() {}
 
     @objc private func chooseGap(_ sender: NSMenuItem) {
         wm.setGap(CGFloat(sender.tag))

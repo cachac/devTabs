@@ -48,6 +48,19 @@ enum Keys {
     /// ⌃⌘F, ⌃⌘Q, ⌃⌘D y ⌃⌘Espacio, que devTabs no usa.
     static let base = controlKey | cmdKey
 
+    /// Lo que muestra el menú «Atajos», todo con Control + Comando. Mantenerla igual a `register`.
+    static let reference: [(keys: String, action: String)] = [
+        ("← ↓ ↑ →", "Mover el foco; en un stack, cambiar de pestaña"),
+        ("Shift + ← ↓ ↑ →", "Mover la ventana; en un stack, correr la pestaña"),
+        ("S", "Juntar o separar el stack del workspace"),
+        ("A", "Pasar a acordeón o volver a pestañas"),
+        ("O", "Cambiar la orientación de la división"),
+        ("+  /  -", "Agrandar o achicar el hueco"),
+        ("G", "Flotar centrada o volver a su lugar"),
+        ("Z", "Zoom temporal"),
+        ("Y", "Prender o apagar el tiling del workspace"),
+    ]
+
     /// Los atajos con caracteres se registran por lo que escribe la tecla en la distribución activa, no por su posición en un
     /// teclado estadounidense: en el latinoamericano la tecla del `=` de ese teclado escribe `¿`.
     static func register(_ wm: WindowManager) {

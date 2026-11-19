@@ -32,7 +32,7 @@ Vuelven los stacks, los acordeones, los tamaños y las ventanas flotantes de tod
 
 ## Menú
 
-En el ícono de la barra de menú: separación entre ventanas, reacomodar y salir.
+En el ícono de la barra de menú: prender o apagar el tiling, reacomodar, separación entre ventanas, la lista de atajos y salir.
 
 ## Instalar
 
