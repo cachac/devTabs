@@ -22,6 +22,10 @@ Tiling para macOS con pestañas al estilo de Pop!_OS y modo acordeón.
 - **Arrastrar el borde de la ventana de adelante en un acordeón**: ajusta cuánto se ve de las de atrás. El ancho elegido queda para los próximos acordeones.
 - **Soltar una ventana en otro monitor**: pasa a acomodarse ahí.
 
+## Al reabrir
+
+Vuelven los stacks, los acordeones, los tamaños y las ventanas flotantes de todo lo que siga abierto.
+
 ## Menú
 
 En el ícono de la barra de menú: separación entre ventanas, reacomodar y salir.

@@ -241,6 +241,41 @@ final class LayoutTreeTests: XCTestCase {
         XCTAssertEqual(frames(tree)[3], CGRect(x: 1000, y: 0, width: 600, height: 1000))
     }
 
+    private func sampleTree() -> LayoutTree {
+        // 1 a la izquierda; a la derecha, arriba un acordeón [2, 3] con franja ajustada y abajo la 4, oculta.
+        let tree = LayoutTree()
+        insert(tree, 1)
+        insert(tree, 2, focused: 1)
+        insert(tree, 4, focused: 2)
+        tree.toggleStack(2, area: area, config: config)
+        insert(tree, 3, focused: 2)
+        tree.toggleAccordion(3)
+        tree.adjustPeek(3, toFit: CGRect(x: 1000, y: 28, width: 600, height: 472), area: area, config: config)
+        tree.adjustRatio(1, by: 0.1)
+        tree.setHidden(4, true)
+        return tree
+    }
+
+    func testASavedTreeComesBackTheSame() throws {
+        let tree = sampleTree()
+        let data = try JSONEncoder().encode(tree.snapshot)
+        let restored = LayoutTree(snapshot: try JSONDecoder().decode(TreeSnapshot.self, from: data))
+        XCTAssertEqual(restored.snapshot, tree.snapshot)
+        XCTAssertEqual(frames(restored), frames(tree))
+        XCTAssertEqual(restored.hidden, [4])
+        XCTAssertEqual(restored.tile(containing: 2)?.mode, .accordion)
+        XCTAssertEqual(restored.tile(containing: 2)?.activeWindow, 3)
+    }
+
+    func testRestoringDropsClosedWindowsAndEmptySpaces() {
+        let restored = LayoutTree(snapshot: sampleTree().snapshot)
+        restored.prune(keeping: [2, 3])
+        XCTAssertEqual(restored.windows, [2, 3])
+        XCTAssertEqual(restored.tiles.count, 1)
+        XCTAssertTrue(restored.hidden.isEmpty)
+        XCTAssertEqual(restored.layout(in: area, config: config).first?.rect, area)
+    }
+
     func testMovingOutOfAStackDetachesTheWindow() {
         let tree = stack([1, 2])
         XCTAssertEqual(tree.move(2, .right, area: area, config: config), .detached)

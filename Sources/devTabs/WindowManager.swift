@@ -41,13 +41,56 @@ final class WindowManager {
     private var placedAt: [WindowID: Date] = [:]
     /// La ventana que el usuario está moviendo o redimensionando; mientras tanto no se acomoda ninguna.
     private var dragging: WindowID?
-    /// Ventanas minimizadas o de apps ocultas que siguen en su árbol, para saber si después se cerraron.
-    private var dormant: [WindowID: AXWindow] = [:]
+    /// Lo último que se guardó en disco, para no escribir si nada cambió.
+    private var lastSaved: Data?
 
     /// Una ventana que no está en pantalla pero sigue viva: minimizada, o de una app oculta con ⌘H.
     private static func isDormant(_ window: AXWindow) -> Bool {
         guard let app = NSRunningApplication(processIdentifier: window.pid), !app.isTerminated else { return false }
         return app.isHidden || AX.bool(window.element, kAXMinimizedAttribute)
+    }
+
+    // MARK: - Guardar y recuperar
+
+    /// Los árboles con sus stacks y acordeones, y las ventanas flotantes. Los identificadores de ventana duran lo que dura la
+    /// ventana, así que al reabrir devTabs se recupera todo lo que siga abierto; lo que se cerró se descarta.
+    private struct SavedState: Codable {
+        var trees: [String: TreeSnapshot]
+        var floating: [WindowID]
+    }
+
+    private static let stateURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/devTabs/layout.json")
+
+    private func restore() {
+        guard let data = try? Data(contentsOf: Self.stateURL),
+              let state = try? JSONDecoder().decode(SavedState.self, from: data) else { return }
+        let existing = Self.existingWindowIDs()
+        for (key, snapshot) in state.trees {
+            let tree = LayoutTree(snapshot: snapshot)
+            tree.prune(keeping: existing)
+            guard !tree.windows.isEmpty else { continue }
+            trees[key] = tree
+            for window in tree.windows { windowSpace[window] = key }
+        }
+        floating = Set(state.floating).intersection(existing)
+        lastSaved = data
+        Log.write("recuperados \(trees.count) workspaces con \(windowSpace.count) ventanas")
+    }
+
+    private func save() {
+        let state = SavedState(trees: trees.filter { !$0.value.windows.isEmpty }.mapValues(\.snapshot), floating: floating.sorted())
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(state), data != lastSaved else { return }
+        try? FileManager.default.createDirectory(at: Self.stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if (try? data.write(to: Self.stateURL, options: .atomic)) != nil { lastSaved = data }
+    }
+
+    /// Todas las ventanas que existen, en cualquier Space: las que no están acá se cerraron.
+    private static func existingWindowIDs() -> Set<WindowID> {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        return Set(list.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
     }
 
     // MARK: - Arranque
@@ -75,12 +118,14 @@ final class WindowManager {
             self?.scheduleRefresh()
         }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
+        restore()
         refresh()
         Log.write("devTabs iniciado con \(known.count) ventanas en \(displays.count) monitores")
     }
 
     func stop() {
         timer?.invalidate()
+        save()
         bars.values.forEach { $0.orderOut(nil) }
         bars.removeAll()
     }
@@ -165,24 +210,25 @@ final class WindowManager {
         displays = Spaces.current()
         let onScreen = Self.onScreenWindowIDs()
         var seen: [WindowID: AXWindow] = [:]
+        var alive: [WindowID: AXWindow] = [:]   // también las minimizadas y las de apps ocultas
         var visible: [String: [WindowID]] = [:]
         let me = getpid()
-        for app in NSWorkspace.shared.runningApplications
-        where app.activationPolicy == .regular && app.processIdentifier != me && !app.isHidden {
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && app.processIdentifier != me {
             let pid = app.processIdentifier
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appElement, 0.3)
             observe(pid: pid, app: appElement)
             for element in AX.windows(of: appElement) {
-                guard let id = AX.windowID(element), onScreen.contains(id), AX.isManageable(element),
-                      let frame = AX.frame(element), let display = display(containing: frame), !display.isFullscreen else { continue }
+                guard let id = AX.windowID(element) else { continue }
                 let window = AXWindow(element: element, pid: pid, id: id)
+                alive[id] = window
+                guard !app.isHidden, onScreen.contains(id), AX.isManageable(element),
+                      let frame = AX.frame(element), let display = display(containing: frame), !display.isFullscreen else { continue }
                 seen[id] = window
                 observe(window)
                 visible[display.key, default: []].append(id)
             }
         }
-        let previous = known.merging(dormant) { current, _ in current }
         known = seen
         observedWindows.formIntersection(seen.keys)
         placedAt = placedAt.filter { seen[$0.key] != nil }
@@ -193,24 +239,20 @@ final class WindowManager {
             let here = visible[display.key] ?? []
             let hereSet = Set(here)
             for window in tree.windows where !hereSet.contains(window) {
-                if let ax = previous[window], Self.isDormant(ax) {
+                if let ax = alive[window], Self.isDormant(ax) {
                     tree.setHidden(window, true)   // minimizada o de una app oculta: conserva su lugar
-                    dormant[window] = ax
                 } else {
                     tree.remove(window)
-                    dormant[window] = nil
                     floating.remove(window)
                     if windowSpace[window] == display.key { windowSpace[window] = nil }
                 }
             }
             for window in here where tree.hidden.contains(window) && !floating.contains(window) {
                 tree.setHidden(window, false)
-                dormant[window] = nil
             }
             for window in here where !floating.contains(window) && !tree.contains(window) {
                 if let old = windowSpace[window], old != display.key {
                     trees[old]?.remove(window)
-                    dormant[window] = nil
                 }
                 guard let ax = seen[window], AX.isSettable(ax.element, kAXSizeAttribute) else {
                     floating.insert(window)   // una ventana que no deja cambiar su tamaño queda flotando
@@ -254,6 +296,7 @@ final class WindowManager {
             panel.orderOut(nil)
             bars[id] = nil
         }
+        save()
     }
 
     private func setFrameIfNeeded(_ window: AXWindow, _ frame: CGRect) {

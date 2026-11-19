@@ -90,6 +90,18 @@ public enum MoveResult: Equatable, Sendable {
     case none, swapped, joined, detached
 }
 
+/// Un árbol listo para guardar en disco y recuperar al reabrir la app.
+public struct TreeSnapshot: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    public var hidden: [WindowID]
+    public var root: NodeSnapshot?
+}
+
+public indirect enum NodeSnapshot: Codable, Equatable, Sendable {
+    case tile(windows: [WindowID], active: Int, isStack: Bool, accordion: Bool, peek: CGFloat?)
+    case split(horizontal: Bool, ratio: CGFloat, first: NodeSnapshot, second: NodeSnapshot)
+}
+
 /// El árbol de un Space en un monitor. Las coordenadas tienen el origen arriba a la izquierda, como la API de Accesibilidad.
 public final class LayoutTree {
     public private(set) var root: Node?
@@ -98,6 +110,22 @@ public final class LayoutTree {
     public private(set) var hidden: Set<WindowID> = []
 
     public init() {}
+
+    public init(snapshot: TreeSnapshot) {
+        enabled = snapshot.enabled
+        root = snapshot.root.map(Self.build)
+        hidden = Set(snapshot.hidden).intersection(windows)
+    }
+
+    public var snapshot: TreeSnapshot {
+        TreeSnapshot(enabled: enabled, hidden: hidden.sorted(), root: root.map(Self.snapshot))
+    }
+
+    /// Saca las ventanas que ya no existen y los huecos que quedan vacíos.
+    public func prune(keeping existing: Set<WindowID>) {
+        for window in windows where !existing.contains(window) { remove(window) }
+        for tile in tiles where tile.windows.isEmpty { removeTile(tile) }
+    }
 
     public var tiles: [TileNode] {
         var out: [TileNode] = []
@@ -371,6 +399,30 @@ public final class LayoutTree {
     }
 
     // MARK: - Internos
+
+    private static func snapshot(_ node: Node) -> NodeSnapshot {
+        if let split = node as? SplitNode {
+            return .split(horizontal: split.orientation == .horizontal, ratio: split.ratio,
+                          first: snapshot(split.first), second: snapshot(split.second))
+        }
+        let tile = node as! TileNode
+        return .tile(windows: tile.windows, active: tile.active, isStack: tile.isStack, accordion: tile.mode == .accordion, peek: tile.peek)
+    }
+
+    private static func build(_ snapshot: NodeSnapshot) -> Node {
+        switch snapshot {
+        case let .tile(windows, active, isStack, accordion, peek):
+            let tile = TileNode(windows)
+            tile.active = min(max(0, active), max(0, windows.count - 1))
+            tile.isStack = isStack
+            tile.mode = accordion ? .accordion : .tabs
+            tile.peek = peek
+            return tile
+        case let .split(horizontal, ratio, first, second):
+            return SplitNode(horizontal ? .horizontal : .vertical, ratio: min(0.9, max(0.1, ratio)),
+                             first: build(first), second: build(second))
+        }
+    }
 
     private func collect(_ node: Node?, into out: inout [TileNode]) {
         if let tile = node as? TileNode {
