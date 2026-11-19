@@ -10,7 +10,20 @@ private func axObserverCallback(_ observer: AXObserver, _ element: AXUIElement, 
 final class WindowManager {
     static var shared: WindowManager?
 
-    let config = Config(gap: 8, barHeight: 28, accordionPadding: 30)
+    /// La separación entre ventanas y la franja del accordion se guardan en las preferencias de la app (`dev.devtabs`).
+    private(set) var config: Config = {
+        let defaults = UserDefaults.standard
+        var config = Config(gap: 8, barHeight: 28, accordionPadding: 30)
+        if defaults.object(forKey: "gap") != nil { config.gap = CGFloat(defaults.double(forKey: "gap")) }
+        if defaults.object(forKey: "accordionPadding") != nil { config.accordionPadding = CGFloat(defaults.double(forKey: "accordionPadding")) }
+        return config
+    }()
+
+    func setGap(_ value: CGFloat) {
+        config.gap = value
+        UserDefaults.standard.set(Double(value), forKey: "gap")
+        apply()
+    }
 
     private var trees: [String: LayoutTree] = [:]
     private var windowSpace: [WindowID: String] = [:]
@@ -28,6 +41,14 @@ final class WindowManager {
     private var placedAt: [WindowID: Date] = [:]
     /// La ventana que el usuario está moviendo o redimensionando; mientras tanto no se acomoda ninguna.
     private var dragging: WindowID?
+    /// Ventanas minimizadas o de apps ocultas que siguen en su árbol, para saber si después se cerraron.
+    private var dormant: [WindowID: AXWindow] = [:]
+
+    /// Una ventana que no está en pantalla pero sigue viva: minimizada, o de una app oculta con ⌘H.
+    private static func isDormant(_ window: AXWindow) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: window.pid), !app.isTerminated else { return false }
+        return app.isHidden || AX.bool(window.element, kAXMinimizedAttribute)
+    }
 
     // MARK: - Arranque
 
@@ -89,7 +110,8 @@ final class WindowManager {
         if first { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.finishDrag() } }
     }
 
-    /// Al soltar: si era la ventana activa de un accordion, sus bordes fijan cuánto asoman las de atrás; si no, vuelve a su lugar.
+    /// Al soltar: el borde de la ventana activa de un accordion fija cuánto asoman las de atrás (y queda como franja por
+    /// omisión); el borde compartido con otra ventana corre la división. Si sólo se movió, vuelve a su lugar.
     private func finishDrag() {
         guard let window = dragging else { return }
         if NSEvent.pressedMouseButtons != 0 {
@@ -99,7 +121,11 @@ final class WindowManager {
         dragging = nil
         if let key = windowSpace[window], let tree = trees[key], let display = displays.first(where: { $0.key == key }),
            let ax = known[window], let frame = AX.frame(ax.element) {
-            tree.adjustPeek(window, toFit: frame, area: display.area, config: config)
+            if let peek = tree.adjustPeek(window, toFit: frame, area: display.area, config: config) {
+                config.accordionPadding = peek
+                UserDefaults.standard.set(Double(peek), forKey: "accordionPadding")
+            }
+            tree.resizeTile(window, to: frame, area: display.area, config: config)
         }
         refresh()
     }
@@ -126,7 +152,11 @@ final class WindowManager {
     private func handleFocus() {
         guard let window = focusedWindowID(), let key = windowSpace[window], let tree = trees[key] else { return }
         lastFocused = window
-        if tree.activate(window) { apply() }
+        if tree.activate(window) {
+            apply()
+            restack(window)
+            if let ax = known[window] { AX.perform(ax.element, kAXRaiseAction) }
+        }
     }
 
     // MARK: - Lectura de ventanas
@@ -152,6 +182,7 @@ final class WindowManager {
                 visible[display.key, default: []].append(id)
             }
         }
+        let previous = known.merging(dormant) { current, _ in current }
         known = seen
         observedWindows.formIntersection(seen.keys)
         placedAt = placedAt.filter { seen[$0.key] != nil }
@@ -162,11 +193,25 @@ final class WindowManager {
             let here = visible[display.key] ?? []
             let hereSet = Set(here)
             for window in tree.windows where !hereSet.contains(window) {
-                tree.remove(window)
-                if windowSpace[window] == display.key { windowSpace[window] = nil }
+                if let ax = previous[window], Self.isDormant(ax) {
+                    tree.setHidden(window, true)   // minimizada o de una app oculta: conserva su lugar
+                    dormant[window] = ax
+                } else {
+                    tree.remove(window)
+                    dormant[window] = nil
+                    floating.remove(window)
+                    if windowSpace[window] == display.key { windowSpace[window] = nil }
+                }
+            }
+            for window in here where tree.hidden.contains(window) && !floating.contains(window) {
+                tree.setHidden(window, false)
+                dormant[window] = nil
             }
             for window in here where !floating.contains(window) && !tree.contains(window) {
-                if let old = windowSpace[window], old != display.key { trees[old]?.remove(window) }
+                if let old = windowSpace[window], old != display.key {
+                    trees[old]?.remove(window)
+                    dormant[window] = nil
+                }
                 guard let ax = seen[window], AX.isSettable(ax.element, kAXSizeAttribute) else {
                     floating.insert(window)   // una ventana que no deja cambiar su tamaño queda flotando
                     continue
@@ -196,8 +241,9 @@ final class WindowManager {
                 let id = ObjectIdentifier(layout.tile)
                 live.insert(id)
                 let panel = bars[id] ?? makeBar(id)
-                panel.bar.tabs = layout.tile.windows.enumerated().map { index, window in
-                    TabItem(id: window, title: title(of: window), pid: known[window]?.pid ?? 0, active: index == layout.tile.active)
+                panel.bar.tabs = layout.frames.map { item in
+                    TabItem(id: item.window, title: title(of: item.window), pid: known[item.window]?.pid ?? 0,
+                            active: item.window == layout.activeWindow)
                 }
                 let frame = Spaces.flip(barRect)
                 if panel.frame != frame { panel.setFrame(frame, display: true) }
@@ -236,9 +282,25 @@ final class WindowManager {
     /// En un stack, ← y → pasan de pestaña; desde la primera o la última, el foco sigue a la ventana vecina.
     func focus(_ direction: Direction) {
         guard let context = focusedContext() else { return }
+        // Desde una ventana flotante, el foco va a la ventana acomodada más cercana de ese lado.
+        if floating.contains(context.window), let frame = known[context.window].flatMap({ AX.frame($0.element) }) {
+            let center = CGPoint(x: frame.midX, y: frame.midY)
+            let ahead = context.tree.layout(in: context.display.area, config: config).filter { layout in
+                switch direction {
+                case .left: return layout.rect.midX < center.x
+                case .right: return layout.rect.midX > center.x
+                case .up: return layout.rect.midY < center.y
+                case .down: return layout.rect.midY > center.y
+                }
+            }
+            func distance(_ layout: TileLayout) -> CGFloat { hypot(layout.rect.midX - center.x, layout.rect.midY - center.y) }
+            if let target = ahead.min(by: { distance($0) < distance($1) })?.activeWindow { focusWindow(target) }
+            return
+        }
         if direction == .left || direction == .right,
            let next = context.tree.step(context.window, forward: direction == .right) {
             apply()
+            restack(next)
             focusWindow(next)
             return
         }
@@ -253,7 +315,7 @@ final class WindowManager {
     }
 
     func move(_ direction: Direction) {
-        guard let context = focusedContext() else { return }
+        guard let context = focusedContext(), !floating.contains(context.window) else { return }
         let result = context.tree.move(context.window, direction, area: context.display.area, config: config)
         if result == .none, let display = display(beside: context.display, direction) {
             context.tree.remove(context.window)
@@ -277,7 +339,21 @@ final class WindowManager {
         guard let key = windowSpace[window], let tree = trees[key] else { return }
         tree.activate(window)
         apply()
+        restack(window)
         focusWindow(window)
+    }
+
+    /// En un acordeón de tres o más pestañas, las de atrás se apilan de la más lejana a la más cercana a la activa, para que
+    /// cada franja muestre su propia ventana. La activa se sube después, al enfocarla.
+    private func restack(_ window: WindowID) {
+        guard let key = windowSpace[window], let tree = trees[key], let display = displays.first(where: { $0.key == key }),
+              let layout = tree.layout(in: display.area, config: config).first(where: { $0.frames.contains { $0.window == window } }),
+              layout.tile.mode == .accordion, layout.frames.count > 2,
+              let active = layout.frames.firstIndex(where: { $0.window == layout.activeWindow }) else { return }
+        let behind = layout.frames.indices.filter { $0 != active }.sorted { abs($0 - active) > abs($1 - active) }
+        for index in behind {
+            if let ax = known[layout.frames[index].window] { AX.perform(ax.element, kAXRaiseAction) }
+        }
     }
 
     func toggleAccordion() {
@@ -298,18 +374,24 @@ final class WindowManager {
         apply()
     }
 
+    /// Flotar: la ventana sale del layout, queda centrada al 60 % × 70 % del monitor y adelante, y su lugar se guarda.
+    /// Volver: ocupa otra vez exactamente ese lugar.
     func toggleFloat() {
-        guard let window = focusedWindowID() else { return }
+        guard let window = focusedWindowID(), let ax = known[window] else { return }
         if floating.remove(window) != nil {
-            refresh()   // la vuelve a meter en el árbol
+            refresh()
+            focusWindow(window)
             return
         }
-        if let key = windowSpace[window] {
-            trees[key]?.remove(window)
-            windowSpace[window] = nil
-        }
+        guard let key = windowSpace[window], let tree = trees[key], let display = displays.first(where: { $0.key == key }) else { return }
+        tree.setHidden(window, true)
         floating.insert(window)
         apply()
+        let a = display.area
+        placedAt[window] = Date()
+        AX.setFrame(ax.element, CGRect(x: a.midX - a.width * 0.3, y: a.midY - a.height * 0.35,
+                                       width: a.width * 0.6, height: a.height * 0.7).integral)
+        focusWindow(window)
     }
 
     /// Prende o apaga el tiling del Space visible en el monitor de la ventana enfocada.

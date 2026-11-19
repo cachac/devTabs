@@ -23,9 +23,9 @@ public enum StackMode: Sendable {
 public struct Config: Sendable {
     public var gap: CGFloat
     public var barHeight: CGFloat
-    /// La franja que asoma de cada lado en un accordion mientras no se ajuste arrastrando el borde.
+    /// Cuánto asoma cada ventana de atrás en un acordeón mientras no se ajuste arrastrando el borde.
     public var accordionPadding: CGFloat
-    /// Lo mínimo que queda a la vista de la ventana activa de un accordion, por más que se arrastre el borde.
+    /// Lo mínimo que mide cada ventana de un acordeón, por más que se arrastre el borde.
     public var minActiveWidth: CGFloat
 
     public init(gap: CGFloat = 8, barHeight: CGFloat = 28, accordionPadding: CGFloat = 30, minActiveWidth: CGFloat = 240) {
@@ -48,9 +48,8 @@ public final class TileNode: Node {
     public internal(set) var active = 0
     public internal(set) var isStack = false
     public internal(set) var mode: StackMode = .tabs
-    /// Las franjas del accordion a la izquierda y a la derecha de la activa, si se ajustaron arrastrando su borde.
-    public internal(set) var peekBefore: CGFloat?
-    public internal(set) var peekAfter: CGFloat?
+    /// Cuánto asoma cada ventana de atrás en el acordeón, si se ajustó arrastrando el borde de la de adelante.
+    public internal(set) var peek: CGFloat?
 
     init(_ windows: [WindowID]) {
         self.windows = windows
@@ -82,7 +81,9 @@ public struct TileLayout {
     public let rect: CGRect
     /// La barra de pestañas; `nil` si el tile no es stack.
     public let barRect: CGRect?
+    /// Sólo las ventanas visibles, en el orden de las pestañas.
     public let frames: [(window: WindowID, frame: CGRect)]
+    public let activeWindow: WindowID?
 }
 
 public enum MoveResult: Equatable, Sendable {
@@ -93,6 +94,8 @@ public enum MoveResult: Equatable, Sendable {
 public final class LayoutTree {
     public private(set) var root: Node?
     public var enabled = true
+    /// Ventanas minimizadas o de apps ocultas: conservan su lugar en el árbol y no ocupan espacio hasta que vuelven.
+    public private(set) var hidden: Set<WindowID> = []
 
     public init() {}
 
@@ -113,10 +116,17 @@ public final class LayoutTree {
     // MARK: - Layout
 
     public func layout(in area: CGRect, config: Config) -> [TileLayout] {
-        guard let root else { return [] }
         var out: [TileLayout] = []
         place(root, in: area.insetBy(dx: config.gap, dy: config.gap), config: config, into: &out)
         return out
+    }
+
+    /// Dónde pone el layout a una ventana visible.
+    public func expectedFrame(of window: WindowID, area: CGRect, config: Config) -> CGRect? {
+        for layout in layout(in: area, config: config) {
+            if let item = layout.frames.first(where: { $0.window == window }) { return item.frame }
+        }
+        return nil
     }
 
     // MARK: - Cambios
@@ -128,7 +138,7 @@ public final class LayoutTree {
             root = TileNode([window])
             return
         }
-        guard let target = focused.flatMap({ tile(containing: $0) }) ?? tiles.last else { return }
+        guard let target = focused.flatMap({ tile(containing: $0) }) ?? tiles.last(where: { isVisible($0) }) ?? tiles.last else { return }
         if target.isStack {
             target.windows.append(window)
             target.active = target.windows.count - 1
@@ -140,11 +150,26 @@ public final class LayoutTree {
     @discardableResult
     public func remove(_ window: WindowID) -> Bool {
         guard let tile = tile(containing: window), let index = tile.windows.firstIndex(of: window) else { return false }
+        hidden.remove(window)
         tile.windows.remove(at: index)
         if index < tile.active { tile.active -= 1 }
         tile.active = min(tile.active, max(0, tile.windows.count - 1))
         if tile.windows.isEmpty { removeTile(tile) }
         return true
+    }
+
+    /// Oculta o vuelve a mostrar una ventana sin sacarla de su lugar. Si era la activa de un stack, pasa a serlo la más cercana.
+    public func setHidden(_ window: WindowID, _ value: Bool) {
+        guard let tile = tile(containing: window) else { return }
+        guard value else {
+            hidden.remove(window)
+            return
+        }
+        hidden.insert(window)
+        if tile.activeWindow == window {
+            let candidates = tile.windows.indices.filter { !hidden.contains(tile.windows[$0]) }
+            if let nearest = candidates.min(by: { abs($0 - tile.active) < abs($1 - tile.active) }) { tile.active = nearest }
+        }
     }
 
     /// El tile más cercano en esa dirección que comparte franja con el actual.
@@ -185,7 +210,7 @@ public final class LayoutTree {
     @discardableResult
     public func move(_ window: WindowID, _ direction: Direction, area: CGRect, config: Config) -> MoveResult {
         guard let tile = tile(containing: window) else { return .none }
-        if tile.isStack && tile.windows.count > 1 {
+        if tile.isStack && visible(tile).windows.count > 1 {
             remove(window)
             split(tile, with: TileNode([window]), orientation: direction.orientation, newFirst: direction.placesFirst)
             return .detached
@@ -201,6 +226,7 @@ public final class LayoutTree {
         swap(&tile.active, &other.active)
         swap(&tile.isStack, &other.isStack)
         swap(&tile.mode, &other.mode)
+        swap(&tile.peek, &other.peek)
         return .swapped
     }
 
@@ -213,6 +239,7 @@ public final class LayoutTree {
             return
         }
         tile.isStack = false
+        tile.peek = nil
         let keep = tile.activeWindow ?? window
         let others = tile.windows.filter { $0 != keep }
         tile.windows = [keep]
@@ -246,29 +273,33 @@ public final class LayoutTree {
         tile.parent = nil
     }
 
-    /// Pasa a la pestaña vecina del stack sin dar la vuelta; `nil` si no es stack o ya está en la primera o la última.
+    /// Pasa a la pestaña visible vecina sin dar la vuelta; `nil` si no es stack o ya está en la primera o la última.
     @discardableResult
     public func step(_ window: WindowID, forward: Bool) -> WindowID? {
-        guard let tile = tile(containing: window), tile.isStack, tile.windows.count > 1 else { return nil }
-        let next = tile.active + (forward ? 1 : -1)
-        guard tile.windows.indices.contains(next) else { return nil }
-        tile.active = next
-        return tile.activeWindow
+        guard let tile = tile(containing: window), tile.isStack else { return nil }
+        let (list, active) = visible(tile)
+        let next = active + (forward ? 1 : -1)
+        guard list.count > 1, list.indices.contains(next), let index = tile.windows.firstIndex(of: list[next]) else { return nil }
+        tile.active = index
+        return list[next]
     }
 
-    /// Pasa a la pestaña siguiente o anterior del stack y devuelve la ventana que quedó activa.
+    /// Pasa a la pestaña visible siguiente o anterior, dando la vuelta, y devuelve la ventana que quedó activa.
     @discardableResult
     public func cycle(_ window: WindowID, forward: Bool) -> WindowID? {
-        guard let tile = tile(containing: window), tile.isStack, tile.windows.count > 1 else { return nil }
-        let count = tile.windows.count
-        tile.active = (tile.active + (forward ? 1 : count - 1)) % count
-        return tile.activeWindow
+        guard let tile = tile(containing: window), tile.isStack else { return nil }
+        let (list, active) = visible(tile)
+        guard list.count > 1 else { return nil }
+        let next = list[(active + (forward ? 1 : list.count - 1)) % list.count]
+        tile.active = tile.windows.firstIndex(of: next) ?? tile.active
+        return next
     }
 
     /// Marca la ventana como la activa de su tile; devuelve `true` si cambió.
     @discardableResult
     public func activate(_ window: WindowID) -> Bool {
-        guard let tile = tile(containing: window), let index = tile.windows.firstIndex(of: window), tile.active != index else { return false }
+        guard !hidden.contains(window), let tile = tile(containing: window), let index = tile.windows.firstIndex(of: window),
+              tile.active != index else { return false }
         tile.active = index
         return true
     }
@@ -290,6 +321,55 @@ public final class LayoutTree {
         parent.ratio = min(0.9, max(0.1, parent.ratio + signed))
     }
 
+    /// Cuando se arrastra un borde de la ventana activa de un acordeón hacia las de atrás, la franja que asoma de cada una pasa
+    /// a medir lo que quedó a la vista. Mover la ventana sin cambiar su ancho no cuenta. Devuelve la franja nueva, o `nil`.
+    @discardableResult
+    public func adjustPeek(_ window: WindowID, toFit frame: CGRect, area: CGRect, config: Config) -> CGFloat? {
+        guard let tile = tile(containing: window), tile.isStack, tile.mode == .accordion,
+              let layout = layout(in: area, config: config).first(where: { $0.tile === tile }),
+              layout.activeWindow == window, layout.frames.count > 1,
+              let expected = layout.frames.first(where: { $0.window == window })?.frame,
+              abs(frame.width - expected.width) >= 2 else { return nil }
+        let (list, active) = visible(tile)
+        let raw: CGFloat
+        if active > 0 && abs(frame.minX - expected.minX) >= 2 {
+            raw = (frame.minX - layout.rect.minX) / CGFloat(active)
+        } else if active < list.count - 1 && abs(frame.maxX - expected.maxX) >= 2 {
+            raw = (layout.rect.maxX - frame.maxX) / CGFloat(list.count - 1 - active)
+        } else {
+            return nil
+        }
+        let value = min(Self.maxPeek(list.count, layout.rect.width, config), max(0, raw.rounded()))
+        guard abs(value - Self.peek(tile, list.count, layout.rect.width, config)) >= 1 else { return nil }
+        tile.peek = value
+        return value
+    }
+
+    /// Cuando se arrastra el borde de una ventana acomodada, la división que separa ese borde de la ventana vecina se corre
+    /// para que el borde quede donde se soltó, como en Pop. Mover la ventana sin cambiar su tamaño no cuenta. Devuelve `true`
+    /// si cambió alguna división.
+    @discardableResult
+    public func resizeTile(_ window: WindowID, to frame: CGRect, area: CGRect, config: Config) -> Bool {
+        guard let tile = tile(containing: window), let expected = expectedFrame(of: window, area: area, config: config),
+              abs(frame.width - expected.width) >= 2 || abs(frame.height - expected.height) >= 2 else { return false }
+        let rects = nodeRects(in: area, config: config)
+        var changed = false
+        func shift(_ orientation: Orientation, tileIsFirst: Bool, by delta: CGFloat) {
+            guard abs(delta) >= 2, let split = ancestor(of: tile, orientation, tileIsFirst: tileIsFirst),
+                  let rect = rects[ObjectIdentifier(split)] else { return }
+            let total = (orientation == .horizontal ? rect.width : rect.height) - config.gap
+            guard total > 0 else { return }
+            let first = (total * split.ratio).rounded() + delta
+            split.ratio = min(0.9, max(0.1, first / total))
+            changed = true
+        }
+        shift(.horizontal, tileIsFirst: true, by: frame.maxX - expected.maxX)
+        shift(.horizontal, tileIsFirst: false, by: frame.minX - expected.minX)
+        shift(.vertical, tileIsFirst: true, by: frame.maxY - expected.maxY)
+        shift(.vertical, tileIsFirst: false, by: frame.minY - expected.minY)
+        return changed
+    }
+
     // MARK: - Internos
 
     private func collect(_ node: Node?, into out: inout [TileNode]) {
@@ -301,14 +381,62 @@ public final class LayoutTree {
         }
     }
 
-    private func place(_ node: Node, in rect: CGRect, config: Config, into out: inout [TileLayout]) {
+    private func isVisible(_ node: Node?) -> Bool {
+        if let tile = node as? TileNode { return tile.windows.contains { !hidden.contains($0) } }
+        if let split = node as? SplitNode { return isVisible(split.first) || isVisible(split.second) }
+        return false
+    }
+
+    /// Las ventanas visibles de un tile y la posición de la activa entre ellas.
+    private func visible(_ tile: TileNode) -> (windows: [WindowID], active: Int) {
+        let list = tile.windows.filter { !hidden.contains($0) }
+        return (list, tile.activeWindow.flatMap { list.firstIndex(of: $0) } ?? 0)
+    }
+
+    /// Una división con un lado oculto le da todo el espacio al otro.
+    private func place(_ node: Node?, in rect: CGRect, config: Config, into out: inout [TileLayout]) {
+        guard let node, isVisible(node) else { return }
         if let split = node as? SplitNode {
+            guard isVisible(split.first), isVisible(split.second) else {
+                place(isVisible(split.first) ? split.first : split.second, in: rect, config: config, into: &out)
+                return
+            }
             let (a, b) = Self.divide(rect, split.orientation, split.ratio, config.gap)
             place(split.first, in: a, config: config, into: &out)
             place(split.second, in: b, config: config, into: &out)
         } else if let tile = node as? TileNode {
-            out.append(Self.tileLayout(tile, rect, config))
+            out.append(tileLayout(tile, rect, config))
         }
+    }
+
+    private func nodeRects(in area: CGRect, config: Config) -> [ObjectIdentifier: CGRect] {
+        var out: [ObjectIdentifier: CGRect] = [:]
+        func visit(_ node: Node?, _ rect: CGRect) {
+            guard let node, isVisible(node) else { return }
+            out[ObjectIdentifier(node)] = rect
+            guard let split = node as? SplitNode else { return }
+            if isVisible(split.first) && isVisible(split.second) {
+                let (a, b) = Self.divide(rect, split.orientation, split.ratio, config.gap)
+                visit(split.first, a)
+                visit(split.second, b)
+            } else {
+                visit(isVisible(split.first) ? split.first : split.second, rect)
+            }
+        }
+        visit(root, area.insetBy(dx: config.gap, dy: config.gap))
+        return out
+    }
+
+    /// La división más cercana con esa orientación que tiene a `node` del lado pedido y una ventana visible del otro: el borde
+    /// que las separa es el que se arrastró.
+    private func ancestor(of node: Node, _ orientation: Orientation, tileIsFirst: Bool) -> SplitNode? {
+        var child = node
+        while let parent = child.parent {
+            if parent.orientation == orientation && (tileIsFirst ? parent.first === child : parent.second === child)
+                && isVisible(tileIsFirst ? parent.second : parent.first) { return parent }
+            child = parent
+        }
+        return nil
     }
 
     static func divide(_ r: CGRect, _ orientation: Orientation, _ ratio: CGFloat, _ gap: CGFloat) -> (CGRect, CGRect) {
@@ -324,73 +452,39 @@ public final class LayoutTree {
         }
     }
 
-    /// En pestañas todas las ventanas ocupan el mismo lugar debajo de la barra. En accordion la activa deja una franja
-    /// de cada lado donde hay otras: las de antes asoman a la izquierda y las de después a la derecha.
-    static func tileLayout(_ tile: TileNode, _ r: CGRect, _ config: Config) -> TileLayout {
+    /// En pestañas todas las ventanas ocupan el mismo lugar debajo de la barra. En acordeón cada una tiene un lugar fijo,
+    /// corrido una franja respecto de la anterior y con el mismo ancho: cambiar de pestaña sólo cambia cuál queda adelante, así
+    /// ninguna ventana cambia de tamaño ni reacomoda su contenido.
+    private func tileLayout(_ tile: TileNode, _ r: CGRect, _ config: Config) -> TileLayout {
+        let (list, active) = visible(tile)
+        let activeWindow = list.indices.contains(active) ? list[active] : nil
         guard tile.isStack else {
-            return TileLayout(tile: tile, rect: r, barRect: nil, frames: tile.windows.map { ($0, r) })
+            return TileLayout(tile: tile, rect: r, barRect: nil, frames: list.map { ($0, r) }, activeWindow: activeWindow)
         }
         let bar = CGRect(x: r.minX, y: r.minY, width: r.width, height: config.barHeight)
         let content = CGRect(x: r.minX, y: r.minY + config.barHeight, width: r.width, height: max(0, r.height - config.barHeight))
-        let count = tile.windows.count
-        var frames: [(window: WindowID, frame: CGRect)] = []
-        let (before, after) = peeks(tile, content.width, config)
-        for (index, window) in tile.windows.enumerated() {
-            var frame = content
-            if tile.mode == .accordion && count > 1 {
-                if index == tile.active {
-                    frame = CGRect(x: content.minX + before, y: content.minY, width: content.width - before - after, height: content.height)
-                } else if index < tile.active {
-                    frame = CGRect(x: content.minX, y: content.minY, width: content.width - after, height: content.height)
-                } else {
-                    frame = CGRect(x: content.minX + before, y: content.minY, width: content.width - before, height: content.height)
-                }
+        var frames: [(window: WindowID, frame: CGRect)] = list.map { ($0, content) }
+        if tile.mode == .accordion && list.count > 1 {
+            let peek = Self.peek(tile, list.count, content.width, config)
+            let width = content.width - CGFloat(list.count - 1) * peek
+            frames = list.enumerated().map { index, window in
+                (window, CGRect(x: content.minX + CGFloat(index) * peek, y: content.minY, width: width, height: content.height))
             }
-            frames.append((window, frame))
         }
-        return TileLayout(tile: tile, rect: r, barRect: bar, frames: frames)
+        return TileLayout(tile: tile, rect: r, barRect: bar, frames: frames, activeWindow: activeWindow)
     }
 
-    /// Las franjas de cada lado de la activa: sólo donde hay otras pestañas, y achicadas si no dejan `minActiveWidth` a la vista.
-    static func peeks(_ tile: TileNode, _ width: CGFloat, _ config: Config) -> (before: CGFloat, after: CGFloat) {
-        var before: CGFloat = tile.active > 0 ? max(0, tile.peekBefore ?? config.accordionPadding) : 0
-        var after: CGFloat = tile.active < tile.windows.count - 1 ? max(0, tile.peekAfter ?? config.accordionPadding) : 0
-        let room = max(0, width - config.minActiveWidth)
-        if before + after > room {
-            let scale = room / (before + after)
-            before = (before * scale).rounded(.down)
-            after = (after * scale).rounded(.down)
-        }
-        return (before, after)
+    /// Cada franja deja a cada ventana al menos `minActiveWidth` y no puede superar el ancho de las ventanas, porque si no
+    /// quedaría un hueco sin cubrir entre ellas.
+    static func maxPeek(_ count: Int, _ width: CGFloat, _ config: Config) -> CGFloat {
+        guard count > 1 else { return 0 }
+        let byMinimum = (width - config.minActiveWidth) / CGFloat(count - 1)
+        let byCoverage = width / CGFloat(count)
+        return max(0, min(byMinimum, byCoverage).rounded(.down))
     }
 
-    /// Cuando se arrastra un borde de la ventana activa de un accordion, la franja de ese lado pasa a medir lo que quedó a la
-    /// vista de las de atrás. Sólo cuentan los bordes que tienen pestañas de ese lado. Devuelve `true` si cambió alguna franja.
-    @discardableResult
-    public func adjustPeek(_ window: WindowID, toFit frame: CGRect, area: CGRect, config: Config) -> Bool {
-        guard let tile = tile(containing: window), tile.isStack, tile.mode == .accordion, tile.windows.count > 1,
-              tile.activeWindow == window,
-              let rect = layout(in: area, config: config).first(where: { $0.tile === tile })?.rect else { return false }
-        let left = rect.minX
-        let right = rect.maxX
-        let room = max(0, rect.width - config.minActiveWidth)
-        let current = Self.peeks(tile, rect.width, config)
-        var changed = false
-        if tile.active > 0 {
-            let value = min(room, max(0, (frame.minX - left).rounded()))
-            if abs(value - current.before) >= 1 {
-                tile.peekBefore = value
-                changed = true
-            }
-        }
-        if tile.active < tile.windows.count - 1 {
-            let value = min(room, max(0, (right - frame.maxX).rounded()))
-            if abs(value - current.after) >= 1 {
-                tile.peekAfter = value
-                changed = true
-            }
-        }
-        return changed
+    static func peek(_ tile: TileNode, _ count: Int, _ width: CGFloat, _ config: Config) -> CGFloat {
+        min(maxPeek(count, width, config), max(0, tile.peek ?? config.accordionPadding))
     }
 
     private func orientationFor(_ tile: TileNode, area: CGRect, config: Config) -> Orientation {

@@ -49,12 +49,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "devTabs")
         let menu = NSMenu()
-        menu.addItem(withTitle: "Prender o apagar el tiling en este monitor", action: #selector(toggleTiling), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Prender o apagar el tiling en este workspace", action: #selector(toggleTiling), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Reacomodar", action: #selector(reload), keyEquivalent: "").target = self
+        let gaps = NSMenu()
+        for value in [0, 2, 4, 8, 12, 16, 24] {
+            let option = gaps.addItem(withTitle: "\(value) px", action: #selector(chooseGap(_:)), keyEquivalent: "")
+            option.target = self
+            option.tag = value
+            option.state = CGFloat(value) == wm.config.gap ? .on : .off
+        }
+        menu.addItem(withTitle: "Separación entre ventanas", action: nil, keyEquivalent: "").submenu = gaps
         menu.addItem(.separator())
         menu.addItem(withTitle: "Salir de devTabs", action: #selector(quit), keyEquivalent: "q").target = self
         item.menu = menu
         statusItem = item
+    }
+
+    @objc private func chooseGap(_ sender: NSMenuItem) {
+        wm.setGap(CGFloat(sender.tag))
+        sender.menu?.items.forEach { $0.state = $0 === sender ? .on : .off }
     }
 
     @objc private func toggleTiling() { wm.toggleTiling() }
