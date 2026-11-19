@@ -542,7 +542,9 @@ public final class LayoutTree {
             return TileLayout(tile: tile, rect: r, barRect: nil, frames: list.map { ($0, r) }, activeWindow: activeWindow)
         }
         let bar = CGRect(x: r.minX, y: r.minY, width: r.width, height: config.barHeight)
-        let content = CGRect(x: r.minX, y: r.minY + config.barHeight, width: r.width, height: max(0, r.height - config.barHeight))
+        // Entre la barra y las ventanas va la misma separación que entre ventanas.
+        let top = config.barHeight + config.gap
+        let content = CGRect(x: r.minX, y: r.minY + top, width: r.width, height: max(0, r.height - top))
         var frames: [(window: WindowID, frame: CGRect)] = list.map { ($0, content) }
         if tile.mode == .accordion && list.count > 1 {
             let peek = Self.peek(tile, list.count, content.width, config)

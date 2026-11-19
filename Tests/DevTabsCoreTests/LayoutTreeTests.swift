@@ -52,6 +52,14 @@ final class LayoutTreeTests: XCTestCase {
         XCTAssertEqual(f[2], CGRect(x: 804, y: 8, width: 788, height: 984))
     }
 
+    func testTheBarIsSeparatedFromItsWindowsByTheGap() {
+        let tree = stack([1, 2])
+        let gapped = Config(gap: 8, barHeight: 28, accordionPadding: 30)
+        let layout = tree.layout(in: area, config: gapped).first
+        XCTAssertEqual(layout?.barRect, CGRect(x: 8, y: 8, width: 1584, height: 28))
+        XCTAssertEqual(frames(tree, gapped)[2], CGRect(x: 8, y: 44, width: 1584, height: 948))
+    }
+
     func testRemovingCollapsesTheSplit() {
         let tree = LayoutTree()
         insert(tree, 1)
